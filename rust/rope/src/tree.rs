@@ -16,6 +16,7 @@
 
 use std::cmp::{min, Ordering};
 use std::marker::PhantomData;
+use std::ops::{Add, Sub};
 use std::sync::Arc;
 
 use crate::interval::{Interval, IntervalBounds};
@@ -195,6 +196,42 @@ pub trait Metric<N: NodeInfo> {
     fn can_fragment() -> bool;
 }
 
+#[derive(PartialEq, Eq)]
+pub enum UnitAffinity {
+    Before,
+    After,
+}
+
+/// A trait for NodeInfo to convert between base units and measured units
+/// for example, for a Rope, the base unit can be the bytes and the measured
+/// units can be line number
+/// The base unit is usize and measured units is a generic type
+pub trait UnitConverter<N: NodeInfo, U> {
+    /// Given the measured units, how many base units are there in this NodeInfo
+    fn count(l: &N::L, in_measured_units: U) -> usize;
+
+    /// Measure the NodeInfo given the base units
+    fn measure(l: &N::L, in_base_units: usize) -> U;
+
+    /// The base units in this NodeInfo
+    fn base(l: &N) -> usize;
+
+    /// The measured units in this NodeInfo
+    fn node_measured(l: &N) -> U;
+
+    /// Return The UnitAffinity of the converter when doing count
+    /// when the unit is at the edge of two nodes
+    /// For UnitAffinity::Before, it will use the node before
+    /// For UnitAffinity::After, it will use the node after
+    fn count_affinty() -> UnitAffinity;
+
+    /// Return The UnitAffinity of the converter when doing measure
+    /// when the unit is at the edge of two nodes
+    /// For UnitAffinity::Before, it will use the node before
+    /// For UnitAffinity::After, it will use the node after
+    fn measure_affinty() -> UnitAffinity;
+}
+
 impl<N: NodeInfo> Node<N> {
     pub fn from_leaf(l: N::L) -> Node<N> {
         let len = l.len();
@@ -230,6 +267,10 @@ impl<N: NodeInfo> Node<N> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn info(&self) -> &N {
+        &self.0.info
     }
 
     /// Returns `true` if these two `Node`s share the same underlying data.
@@ -424,6 +465,155 @@ impl<N: NodeInfo> Node<N> {
         b.push(new.into());
         self.push_subseq(&mut b, self_iv.suffix(iv));
         *self = b.build();
+    }
+
+    /// Given the measured units, how many base units are there
+    pub fn count_unit<U, C: UnitConverter<N, U>>(&self, m: U) -> usize
+    where
+        U: PartialOrd + Sub<Output = U>,
+    {
+        let affinity = C::count_affinty();
+
+        let mut m = if m >= C::node_measured(&self.0.info) {
+            if affinity == UnitAffinity::After {
+                return C::base(&self.0.info);
+            }
+            C::node_measured(&self.0.info)
+        } else {
+            m
+        };
+
+        let mut node = self;
+        let mut base = 0;
+
+        while node.height() > 0 {
+            for child in node.get_children() {
+                let child_m = C::node_measured(&child.0.info);
+                if m == child_m {
+                    if affinity == UnitAffinity::Before {
+                        // if affinity is before
+                        // then we just break out and count it in the current leaf
+                        //
+                        // if affinity is after
+                        // then we can accum the node info
+                        // and do the final count with 0 units in the next leaf
+                        // to make things more efficent
+                        node = child;
+                        break;
+                    }
+                } else if m < child_m {
+                    node = child;
+                    break;
+                }
+                base += C::base(&child.0.info);
+                m = m - child_m;
+            }
+        }
+
+        let l = node.get_leaf();
+        base + C::count(l, m)
+    }
+
+    /// Measure the tree given the base units
+    pub fn measure_unit<U, C: UnitConverter<N, U>>(&self, base: usize) -> U
+    where
+        U: Default + Add<Output = U>,
+    {
+        let affinity = C::measure_affinty();
+
+        let mut base = if base >= C::base(&self.0.info) {
+            if affinity == UnitAffinity::After {
+                return C::node_measured(&self.0.info);
+            }
+            C::base(&self.0.info)
+        } else {
+            base
+        };
+
+        let mut node = self;
+        let mut m: U = Default::default();
+
+        while node.height() > 0 {
+            for child in node.get_children() {
+                let child_base = C::base(&child.0.info);
+                if base == child_base {
+                    if affinity == UnitAffinity::Before {
+                        // if affinity is before
+                        // then we just break out and count it in the current leaf
+                        //
+                        // if affinity is after
+                        // then we can accum the node info
+                        // and do the final count with 0 units in the next leaf
+                        // to make things more efficent
+                        node = child;
+                        break;
+                    }
+                } else if base < child_base {
+                    node = child;
+                    break;
+                }
+                m = m + C::node_measured(&child.0.info);
+                base -= child_base;
+            }
+        }
+
+        let l = node.get_leaf();
+        m + C::measure(l, base)
+    }
+
+    /// Convert the measured units between converters
+    pub fn convert<U1, C1: UnitConverter<N, U1>, U2, C2: UnitConverter<N, U2>>(&self, m1: U1) -> U2
+    where
+        U1: PartialOrd + Sub<Output = U1>,
+        U2: Default + Add<Output = U2>,
+    {
+        let affinity = if C1::count_affinty() == UnitAffinity::Before
+            || C2::measure_affinty() == UnitAffinity::Before
+        {
+            UnitAffinity::Before
+        } else {
+            UnitAffinity::After
+        };
+
+        let mut m1 = if m1 >= C1::node_measured(&self.0.info) {
+            if affinity == UnitAffinity::After {
+                return C2::node_measured(&self.0.info);
+            }
+            C1::node_measured(&self.0.info)
+        } else {
+            m1
+        };
+
+        let mut node = self;
+        let mut m2: U2 = Default::default();
+
+        while node.height() > 0 {
+            for child in node.get_children() {
+                let child_m1 = C1::node_measured(&child.0.info);
+                if m1 == child_m1 {
+                    if affinity == UnitAffinity::Before {
+                        // if it can fragment
+                        // then we just break out and count it in the current leaf
+                        //
+                        // if it can't fragment
+                        // then we can accum the node info
+                        // and do the final count with 0 units in the next leaf
+                        // to make things more efficent
+                        node = child;
+                        break;
+                    }
+                } else if m1 < child_m1 {
+                    node = child;
+                    break;
+                }
+                m2 = m2 + C2::node_measured(&child.0.info);
+                m1 = m1 - child_m1;
+            }
+        }
+
+        let l = node.get_leaf();
+        let base = C1::count(l, m1);
+        m2 + C2::measure(l, base)
     }
 
     // doesn't deal with endpoint, handle that specially if you need it
